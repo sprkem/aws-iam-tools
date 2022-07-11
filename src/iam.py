@@ -3,10 +3,20 @@ import boto3
 import multiprocessing
 from collections import defaultdict
 
+sessions = {}
 
-def search_for_permissions(permissions):
-    # print(permissions)
-    client = boto3.client('iam')
+def get_client(service, profile):
+    if profile:
+        if profile not in sessions:
+            sessions[profile] = boto3.Session(profile_name=profile)
+        
+        return sessions[profile].client(service)
+    
+    return boto3.client(service)
+
+
+def search_for_permissions(permissions, profile):
+    client = get_client('iam', profile)
 
     data_map = {
         'policies': {
@@ -20,31 +30,56 @@ def search_for_permissions(permissions):
         data_map['matches'][permission] = []
 
     # search roles
-    roles = get_roles(client)
-    search_roles(roles, permissions, data_map)
+    roles, trust_policies = get_roles(client)
+    search_roles(roles, permissions, data_map, profile)
 
     # search users
     users = get_users(client)
-    search_users(users, permissions, data_map)
+    search_users(users, permissions, data_map, profile)
 
     # search groups
     groups = get_groups(client)
-    search_groups(groups, permissions, data_map)
+    search_groups(groups, permissions, data_map, profile)
 
+    add_trust_info(data_map, trust_policies)
+    
     return data_map['matches']
+
+def add_trust_info(data_map, trust_policies):
+    for permission in data_map['matches']:
+        for r in data_map['matches'][permission]:
+            if r['Type'] != 'Role': continue
+
+            trust = []
+            trust_policy = trust_policies[r['Principal']]
+            for statement in trust_policy['Statement']:
+                principal = statement['Principal']
+
+                for k, v in principal.items():
+                    if isinstance(v, list):
+                        val = ';'.join(v)
+                    else:
+                        val = v
+                    trust.append(f'{k}:{val}')
+
+            r['Trust'] = '; '.join(trust)
 
 
 def get_roles(client):
     roles = []
+    trust = {}
 
     paginator = client.get_paginator('list_roles')
 
     page_iterator = paginator.paginate()
 
     for page in page_iterator:
-        roles.extend([x['RoleName'] for x in page['Roles']])
+        for role in page['Roles']:
+            roles.append(role['RoleName'])
+            trust[role['RoleName']] = role['AssumeRolePolicyDocument']
+        # roles.extend([x['RoleName'] for x in page['Roles']])
 
-    return roles
+    return roles, trust
 
 
 def get_inline_policies(client, principal_name, type):
@@ -70,6 +105,9 @@ def get_inline_policies(client, principal_name, type):
         policies.extend([x for x in page['PolicyNames']])
 
     return policies
+
+def format_policy_arn(arn):
+    return arn.replace("arn:aws:iam::aws:policy/", "")
 
 
 def get_policy(client, principal_name, policy, type):
@@ -112,8 +150,8 @@ def get_attached_policies(client, principal_name, type):
     return policies
 
 
-def search_role(role, permissions, data_map):
-    client = boto3.client('iam')
+def search_role(role, permissions, data_map, profile):
+    client = get_client('iam', profile)
 
     matches = defaultdict(list)
 
@@ -130,7 +168,7 @@ def search_role(role, permissions, data_map):
         for permission in permissions:
             if statement_allows_permissions(policy_data, permission):
                 matches[permission].append({
-                    'AllowType': 'Inline Policy',
+                    'AllowType': 'Inline',
                     'Policy': policy,
                     'Type': 'Role',
                     'Principal': role
@@ -146,8 +184,8 @@ def search_role(role, permissions, data_map):
         for permission in permissions:
             if statement_allows_permissions(policy_data, permission):
                 matches[permission].append({
-                    'AllowType': 'Managed Policy',
-                    'Policy': policy_arn,
+                    'AllowType': 'Managed',
+                    'Policy': format_policy_arn(policy_arn),
                     'Type': 'Role',
                     'Principal': role
                 })
@@ -155,10 +193,10 @@ def search_role(role, permissions, data_map):
     return matches
 
 
-def search_roles(roles, permissions, data_map):
+def search_roles(roles, permissions, data_map, profile):
     star_args = []
     for role in roles:
-        star_args.append((role, permissions, data_map))
+        star_args.append((role, permissions, data_map, profile))
 
     with multiprocessing.Pool() as pool:
         results = pool.starmap(search_role, star_args)
@@ -180,10 +218,10 @@ def get_users(client):
     return users
 
 
-def search_users(users, permissions, data_map):
+def search_users(users, permissions, data_map, profile):
     star_args = []
     for user in users:
-        star_args.append((user, permissions, data_map))
+        star_args.append((user, permissions, data_map, profile))
 
     with multiprocessing.Pool() as pool:
         results = pool.starmap(search_user, star_args)
@@ -192,8 +230,8 @@ def search_users(users, permissions, data_map):
                 data_map['matches'][permission].extend(result[permission])
 
 
-def search_user(user, permissions, data_map):
-    client = boto3.client('iam')
+def search_user(user, permissions, data_map, profile):
+    client = get_client('iam', profile)
 
     matches = defaultdict(list)
 
@@ -209,7 +247,7 @@ def search_user(user, permissions, data_map):
         for permission in permissions:
             if statement_allows_permissions(policy_data, permission):
                 matches[permission].append({
-                    'AllowType': 'Inline Policy',
+                    'AllowType': 'Inline',
                     'Policy': policy,
                     'Type': 'User',
                     'Principal': user
@@ -225,8 +263,8 @@ def search_user(user, permissions, data_map):
         for permission in permissions:
             if statement_allows_permissions(policy_data, permission):
                 matches[permission].append({
-                    'AllowType': 'Managed Policy',
-                    'Policy': policy_arn,
+                    'AllowType': 'Managed',
+                    'Policy': format_policy_arn(policy_arn),
                     'Type': 'User',
                     'Principal': user
                 })
@@ -247,10 +285,10 @@ def get_groups(client):
     return groups
 
 
-def search_groups(groups, permissions, data_map):
+def search_groups(groups, permissions, data_map, profile):
     star_args = []
     for group in groups:
-        star_args.append((group, permissions, data_map))
+        star_args.append((group, permissions, data_map, profile))
 
     with multiprocessing.Pool() as pool:
         results = pool.starmap(search_group, star_args)
@@ -259,8 +297,8 @@ def search_groups(groups, permissions, data_map):
                 data_map['matches'][permission].extend(result[permission])
 
 
-def search_group(group, permissions, data_map):
-    client = boto3.client('iam')
+def search_group(group, permissions, data_map, profile):
+    client = get_client('iam', profile)
 
     matches = defaultdict(list)
 
@@ -276,7 +314,7 @@ def search_group(group, permissions, data_map):
         for permission in permissions:
             if statement_allows_permissions(policy_data, permission):
                 matches[permission].append({
-                    'AllowType': 'Inline Policy',
+                    'AllowType': 'Inline',
                     'Policy': policy,
                     'Type': 'Group',
                     'Principal': group
@@ -292,8 +330,8 @@ def search_group(group, permissions, data_map):
         for permission in permissions:
             if statement_allows_permissions(policy_data, permission):
                 matches[permission].append({
-                    'AllowType': 'Managed Policy',
-                    'Policy': policy_arn,
+                    'AllowType': 'Managed',
+                    'Policy': format_policy_arn(policy_arn),
                     'Type': 'Group',
                     'Principal': group
                 })
